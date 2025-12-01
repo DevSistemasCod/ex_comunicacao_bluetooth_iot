@@ -1,291 +1,309 @@
 import bluetooth
 from micropython import const
 import time
-import json
 
-EVENTO_SCAN_RESULTADO = const(5)
-EVENTO_SCAN_FINALIZADO = const(6)
-EVENTO_CONECTADO = const(7)
-EVENTO_DESCONECTADO = const(8)
-EVENTO_SERVICO_ENCONTRADO = const(9)
-EVENTO_SERVICO_CONCLUIDO = const(10)
+# Constantes de eventos BLE 
+EVENTO_SCAN_RESULTADO            = const(5)
+EVENTO_SCAN_COMPLETO             = const(6)
+EVENTO_CONEXAO_PERIFERICO        = const(7)
+EVENTO_DESCONEXAO_PERIFERICO     = const(8)
+EVENTO_SERVICO_ENCONTRADO        = const(9)
 EVENTO_CARACTERISTICA_ENCONTRADA = const(11)
-EVENTO_CARACTERISTICA_CONCLUIDA = const(12)
-EVENTO_NOTIFICACAO = const(18)
+EVENTO_ESCRITA_CONCLUIDA         = const(17)
+EVENTO_NOTIFICACAO_RECEBIDA      = const(18)
 
-UUID_SERVICO = bluetooth.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-UUID_CARACTERISTICA = bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+# UUIDs do serviço UART (NUS) e características
+UUID_SERVICO_UART = bluetooth.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+UUID_TX_UART      = bluetooth.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")  # Notify (server -> client)
+UUID_RX_UART      = bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")  # Write  (client -> server)
 
-NOME_ALVO = "ESP32-B-LED"
+# Objeto BLE global
+bluetooth_central = None
 
-ble_global = None
-tipo_endereco = None
-endereco = None
+# Dados do dispositivo alvo (servidor)
+nome_alvo = b"ESP32_SERVER"
+tipo_endereco_alvo = None
+endereco_alvo = None
+
+# Dados de conexão e handles
 handle_conexao = None
-inicio_handle = None
-fim_handle = None
-handle_caracteristica = None
+inicio_servico_uart = None
+fim_servico_uart = None
+handle_caracteristica_tx = None
+handle_caracteristica_rx = None
 
-servico_encontrado = False
-caracteristica_encontrada = False
-scan_finalizado = False
-conectado = False
-servicos_concluidos = False
-caracteristicas_concluidas = False
-
-# Restaura todas as variáveis de controle para garantir
-# que uma nova tentativa de conexão BLE comece do zero.
-def resetar_estado():
-    global tipo_endereco
-    global endereco
-    global handle_conexao
-    global inicio_handle
-    global fim_handle
-    global handle_caracteristica
-    global servico_encontrado
-    global caracteristica_encontrada
-    global scan_finalizado
-    global conectado
-    global servicos_concluidos
-    global caracteristicas_concluidas
-
-    # Reset das variáveis para estado inicial
-    tipo_endereco = None
-    endereco = None
-    handle_conexao = None
-    inicio_handle = None
-    fim_handle = None
-    handle_caracteristica = None
-    servico_encontrado = False
-    caracteristica_encontrada = False
-    scan_finalizado = False
-    conectado = False
-    servicos_concluidos = False
-    caracteristicas_concluidas = False
+# Flags de estado
+esta_conectado = False
+servico_uart_encontrado = False
+caracteristicas_uart_encontradas = False
 
 
-# Função auxiliar que percorre os bytes de advertising recebidos
-# para tentar extrair o nome do dispositivo BLE.
-# Usado durante o scan para identificar dispositivos pelo nome.
-def extrair_nome(dados_adv):
-    try:
-        dados = bytes(dados_adv)
-    except:
-        dados = dados_adv
 
-    i = 0
-    nome = None
+# Lê os dados de advertising e tenta extrair o 'Complete Local Name' (código 0x09).
+# retorna o nome como bytes ou None se não encontrar.
+def decodificar_nome_dispositivo(dados_advertising):
+    indice = 0
+    tamanho_dados = len(dados_advertising)
 
-    # Cada estrutura de advertising é formada por: 
-    # [tamanho][tipo][dados...]
-    while i + 1 < len(dados):
-        tamanho = dados[i]
-        # Se o tamanho for zero, não há mais dados
-        if tamanho == 0:
-            break
+    while indice + 1 < tamanho_dados:
+        comprimento = dados_advertising[indice]
+        if comprimento == 0:
+            # Sem mais campos
+            break
 
-        tipo = dados[i + 1]
-        # 0x08 ou 0x09 → nome curto ou nome completo do dispositivo
-        if tipo == 0x08 or tipo == 0x09:
-            try:
-                nome = dados[i + 2 : i + 1 + tamanho].decode("utf-8")
-            except:
-                nome = None
-        
-        # Avança para o próximo campo
-        i = i + 1 + tamanho
+        tipo_campo = dados_advertising[indice + 1]
 
-    return nome
+        # 0x09 = Complete Local Name
+        if tipo_campo == 0x09:
+            inicio_nome = indice + 2
+            fim_nome = indice + 1 + comprimento
+            return dados_advertising[inicio_nome:fim_nome]
 
-# Função callback que trata todos os eventos enviados
-# pelo stack Bluetooth do ESP32 no modo cliente (gattc).
-def evento_ble(evento, dados):
-    global tipo_endereco
-    global endereco
-    global handle_conexao
-    global inicio_handle
-    global fim_handle
-    global handle_caracteristica
-    global servico_encontrado
-    global caracteristica_encontrada
-    global scan_finalizado
-    global conectado
-    global servicos_concluidos
-    global caracteristicas_concluidas
+        # Avança para o próximo campo
+        indice = indice + 1 + comprimento
 
-    # Evento recebido quando um dispositivo BLE é detectado durante o scan
-    if evento == EVENTO_SCAN_RESULTADO:
-        t, a, adv_tipo, rssi, adv = dados
-        nome = extrair_nome(adv)
-        # Se o nome for o dispositivo desejado:
-        if nome == NOME_ALVO:
-            tipo_endereco = t
-            endereco = bytes(a)
-            # Para o scan imediatamente e sinaliza sucesso
-            ble_global.gap_scan(None)
-            scan_finalizado = True
-
-    # Sinaliza que terminou o scan mesmo que nada tenha sido encontrado
-    elif evento == EVENTO_SCAN_FINALIZADO:
-        scan_finalizado = True
-
-    # Quando a conexão GATT se estabelece com sucesso
-    elif evento == EVENTO_CONECTADO:
-        conn, t, a = dados
-        handle_conexao = conn
-        conectado = True
-        # Inicia descoberta de serviços do servidor remoto
-        ble_global.gattc_discover_services(handle_conexao)
-
-    # Quando o dispositivo remoto desconecta
-    elif evento == EVENTO_DESCONECTADO:
-        conn, t, a = dados
-        conectado = False
-        handle_conexao = None
-
-    # Serviço encontrado durante a fase de descoberta GATT
-    elif evento == EVENTO_SERVICO_ENCONTRADO:
-        conn, inicio, fim, uuid = dados
-        
-        # Se o serviço é o que procuramos (Nordic UART Service)
-        if conn == handle_conexao and uuid == UUID_SERVICO:
-            inicio_handle = inicio
-            fim_handle = fim
-            servico_encontrado = True
-
-    # Quando termina a busca pelos serviços
-    elif evento == EVENTO_SERVICO_CONCLUIDO:
-        servicos_concluidos = True
-        
-        # Se o serviço correto foi achado, iniciamos busca pelas characteristics
-        if servico_encontrado:
-            ble_global.gattc_discover_characteristics(
-                handle_conexao, inicio_handle, fim_handle
-            )
-
-    # Characteristic encontrada
-    elif evento == EVENTO_CARACTERISTICA_ENCONTRADA:
-        conn, def_h, val_h, props, uuid = dados
-        if conn == handle_conexao and uuid == UUID_CARACTERISTICA:
-            handle_caracteristica = val_h
-            caracteristica_encontrada = True
-
-    # Finalização do processo de busca de characteristics
-    elif evento == EVENTO_CARACTERISTICA_CONCLUIDA:
-        caracteristicas_concluidas = True
-
-    # Notificação recebida do servidor BLE (callback assíncrono)
-    elif evento == EVENTO_NOTIFICACAO:
-        conn, val_h, dados_not = dados
-        if conn == handle_conexao and val_h == handle_caracteristica:
-            try:
-                msg = dados_not.decode("utf-8")
-            except:
-                msg = str(dados_not)
-            print("Notificação recebida:", msg)
+    return None
 
 
-def iniciar_ble():
-    global ble_global
-    ble_global = bluetooth.BLE()
-    ble_global.active(True)
-    ble_global.irq(evento_ble)
+
+# Trata eventos de resultado de scan.
+# Verifica se o dispositivo encontrado tem o nome alvo e, se tiver, para o scan e tenta conectar.
+def tratar_evento_scan_resultado(dados_evento):
+    global tipo_endereco_alvo, endereco_alvo
+
+    tipo_endereco, endereco, tipo_adv, rssi, dados_advertising = dados_evento
+
+    nome_dispositivo = decodificar_nome_dispositivo(dados_advertising)
+    if nome_dispositivo is None:
+        nome_dispositivo = b""
+
+    if nome_dispositivo == nome_alvo and endereco_alvo is None:
+        print("Encontrado dispositivo alvo:", nome_dispositivo, "RSSI:", rssi)
+
+        tipo_endereco_alvo = tipo_endereco
+        endereco_alvo = bytes(endereco)
+
+        # Para o scan e inicia a conexão
+        bluetooth_central.gap_scan(None)
+        print("Iniciando conexão com o servidor...")
+        bluetooth_central.gap_connect(tipo_endereco_alvo, endereco_alvo)
 
 
-def procurar_e_conectar(tempo_ms=10000):
-    resetar_estado()
-    # Inicia o scan por 'tempo_ms' milissegundos
-    ble_global.gap_scan(tempo_ms, 30000, 30000)
+# Evento disparado quando a conexão com o servidor BLE é estabelecida.
+# Guarda o handle da conexão e inicia a descoberta de serviços.
+def tratar_evento_conexao_periferico(dados_evento):
+    global handle_conexao, esta_conectado
 
-    # Aguarda o scan terminar
-    instante_inicial = time.ticks_ms()
-    while not scan_finalizado and time.ticks_diff(time.ticks_ms(), instante_inicial) < tempo_ms + 2000:
-        time.sleep_ms(100)
+    handle_conexao_recebido, tipo_endereco, endereco = dados_evento
+    handle_conexao = handle_conexao_recebido
+    esta_conectado = True
 
-    # Se nenhum dispositivo alvo foi encontrado
-    if endereco is None:
-        return False
+    print("Conectado ao servidor. Handle da conexão:", handle_conexao)
 
-    try:# Tenta conectar
-        ble_global.gap_connect(tipo_endereco, endereco)
-    except:
-        return False
-
-    # Aguarda conexão
-    instante_inicial = time.ticks_ms()
-    while not conectado and time.ticks_diff(time.ticks_ms(), instante_inicial) < 10000:
-        time.sleep_ms(100)
-
-    if not conectado:
-        return False
-
-    # Aguarda descoberta de serviços
-    instante_inicial = time.ticks_ms()
-    while not servicos_concluidos and time.ticks_diff(time.ticks_ms(), instante_inicial) < 10000:
-        time.sleep_ms(100)
-
-    if not servico_encontrado:
-        return False
-
-    # Aguarda descoberta de characteristics
-    instante_inicial = time.ticks_ms()
-    while not caracteristicas_concluidas and time.ticks_diff(time.ticks_ms(), instante_inicial) < 10000:
-        time.sleep_ms(100)
-
-    if not caracteristica_encontrada:
-        return False
-
-    return True
+    # Inicia descoberta de serviços deste periférico
+    bluetooth_central.gattc_discover_services(handle_conexao)
 
 
-# Envia ao servidor BLE um JSON {"led": true/false}
-# usando escrita GATT na characteristic descoberta.
-def enviar_comando_led(valor):
-    if not conectado:
-        return False
 
-    if handle_caracteristica is None:
-        return False
-    
-    # Monta o JSON {"led": true/false}
-    objeto = {"led": bool(valor)}
-    dados = json.dumps(objeto)
+# Evento disparado quando ocorre uma desconexão do servidor.
+def tratar_evento_desconexao_periferico(dados_evento):
+    global esta_conectado
 
-    try:
-        # Escreve na characteristic usando modo WRITE WITH RESPONSE (1)
-        ble_global.gattc_write(
-            handle_conexao,
-            handle_caracteristica,
-            dados.encode("utf-8"),
-            1
-        )
-        return True
-    except:
-        return False
+    handle_conexao_desconectada, tipo_endereco, endereco = dados_evento
+    print("Desconectado do servidor. Handle:", handle_conexao_desconectada)
+    esta_conectado = False
 
 
-# Alterna o LED remoto entre ligado/desligado continuamente,
-# enviando um novo comando a cada 5 segundos,
-# até que a comunicação falhe.
-def executar_loop_led():
-    estado = False
-    while True:
-        estado = not estado # Alterna estado
-        sucesso = enviar_comando_led(estado)
-        
-        # Se falhou (ex: desconexão), sai do loop
-        if not sucesso:
-            break
-        time.sleep(5)
+# Evento disparado para cada serviço encontrado durante gattc_discover_services.
+# Verifica se o serviço é o UART (NUS) que queremos.
+def tratar_evento_servico_encontrado(dados_evento):
+    global inicio_servico_uart, fim_servico_uart, servico_uart_encontrado
+
+    handle_conexao_evento, start_handle, end_handle, uuid_servico = dados_evento
+
+    if uuid_servico == UUID_SERVICO_UART:
+        inicio_servico_uart = start_handle
+        fim_servico_uart = end_handle
+        servico_uart_encontrado = True
+        print("Serviço UART encontrado. Intervalo de handles:", inicio_servico_uart, "-", fim_servico_uart)
+
+        # descobrimos as características dentro do intervalo deste serviço
+        bluetooth_central.gattc_discover_characteristics(
+            handle_conexao_evento, inicio_servico_uart, fim_servico_uart
+        )
 
 
-def main():
-    iniciar_ble()
-    ok = procurar_e_conectar()
+# Evento disparado para cada característica encontrada no serviço.
+# Se for TX ou RX de UART, guarda os handles.
+def tratar_evento_caracteristica_encontrada(dados_evento):
+    global handle_caracteristica_tx, handle_caracteristica_rx, caracteristicas_uart_encontradas
 
-    if ok:
-        executar_loop_led()
+    handle_conexao_evento, def_handle, valor_handle, propriedades, uuid_caracteristica = dados_evento
+
+    if uuid_caracteristica == UUID_TX_UART:
+        handle_caracteristica_tx = valor_handle
+        print("Característica TX (notify) encontrada. Handle:", handle_caracteristica_tx)
+
+    if uuid_caracteristica == UUID_RX_UART:
+        handle_caracteristica_rx = valor_handle
+        print("Característica RX (write) encontrada. Handle:", handle_caracteristica_rx)
+
+    if handle_caracteristica_tx is not None and handle_caracteristica_rx is not None:
+        caracteristicas_uart_encontradas = True
+        print("Ambas características UART (TX e RX) foram encontradas.")
+        # Após encontrarmos as duas, habilitamos notificações
+        habilitar_notificacoes_uart()
 
 
-if __name__ == "__main__":
-    main()
+# Evento disparado quando uma escrita GATTC foi concluída.
+# Apenas mostramos no console por fins didáticos.
+def tratar_evento_escrita_concluida(dados_evento):
+    handle_conexao_evento, valor_handle, status = dados_evento
+    print("Escrita concluída no handle", valor_handle, "Status:", status)
+
+
+# Evento disparado quando o servidor envia uma notificação (notify) em TX.
+# Mostra os dados recebidos.
+def tratar_evento_notificacao(dados_evento):
+    handle_conexao_evento, valor_handle, dados = dados_evento
+    print("Notificação recebida do servidor. Handle:", valor_handle, "Dados:", dados)
+
+
+
+# Função central de tratamento de eventos BLE.
+# recebe os eventos e encaminha para a funcionalidade específica.
+def ble_irq(evento, dados_evento):
+    if evento == EVENTO_SCAN_RESULTADO:
+        tratar_evento_scan_resultado(dados_evento)
+
+    elif evento == EVENTO_SCAN_COMPLETO:
+        print("Scan completo.")
+
+    elif evento == EVENTO_CONEXAO_PERIFERICO:
+        tratar_evento_conexao_periferico(dados_evento)
+
+    elif evento == EVENTO_DESCONEXAO_PERIFERICO:
+        tratar_evento_desconexao_periferico(dados_evento)
+
+    elif evento == EVENTO_SERVICO_ENCONTRADO:
+        tratar_evento_servico_encontrado(dados_evento)
+
+    elif evento == EVENTO_CARACTERISTICA_ENCONTRADA:
+        tratar_evento_caracteristica_encontrada(dados_evento)
+
+    elif evento == EVENTO_ESCRITA_CONCLUIDA:
+        tratar_evento_escrita_concluida(dados_evento)
+
+    elif evento == EVENTO_NOTIFICACAO_RECEBIDA:
+        tratar_evento_notificacao(dados_evento)
+
+    else:
+        # Para fins didáticos, mostramos se surgir algum evento não tratado.
+        print("Evento BLE não tratado. Código:", evento, "Dados:", dados_evento)
+
+
+
+# Inicializa o módulo BLE em modo central (cliente).
+def inicializar_bluetooth():
+    global bluetooth_central
+
+    bluetooth_central = bluetooth.BLE()
+    bluetooth_central.active(True)
+    bluetooth_central.irq(ble_irq)
+    print("Módulo BLE inicializado como CENTRAL (cliente).")
+
+
+
+# Inicia o processo de scan para encontrar o dispositivo alvo pelo nome.
+def iniciar_scan():
+    intervalo_ms = 30000  # tempo total de scan em ms
+    janela_ms = 30000     # janela de scan em ms
+    print("Iniciando scan em busca do dispositivo com nome:", nome_alvo)
+    bluetooth_central.gap_scan(intervalo_ms, 30000, 30000)
+
+
+
+# Habilita notificações na característica TX do serviço UART.
+# Isso é feito escrevendo no descritor CCCD (handle da TX + 1).
+def habilitar_notificacoes_uart():
+    if handle_conexao is None:
+        print("Não há conexão ativa. Não é possível habilitar notificações.")
+        return
+
+    if handle_caracteristica_tx is None:
+        print("Handle da característica TX é None. Não é possível habilitar notificações.")
+        return
+
+    # Normalmente, o descritor CCCD fica em handle_caracteristica_tx + 1
+    handle_descritor_cccd = handle_caracteristica_tx + 1
+
+    # Valor b'\x01\x00' = habilitar notificações
+    valor_notificacao_ativada = b"\x01\x00"
+
+    print("Habilitando notificações no descritor (CCCD) handle:", handle_descritor_cccd)
+    bluetooth_central.gattc_write(handle_conexao, handle_descritor_cccd, valor_notificacao_ativada, 1)
+
+
+# Envia uma mensagem de bytes para o servidor usando a característica RX.
+def enviar_mensagem_uart(mensagem_bytes):
+    if handle_conexao is None:
+        print("Não há conexão ativa. Não é possível enviar mensagem.")
+        return
+
+    if handle_caracteristica_rx is None:
+        print("Handle da característica RX é None. Não é possível enviar mensagem.")
+        return
+
+    print("Enviando mensagem ao servidor:", mensagem_bytes)
+    bluetooth_central.gattc_write(handle_conexao, handle_caracteristica_rx, mensagem_bytes, 0)
+
+
+
+# Laço principal que alterna comandos LED=1 e LED=0 para o servidor,
+# esperando alguns segundos entre cada envio.
+def ciclo_principal_envio_comandos():
+    estado_led = 0
+
+    while True:
+        if estado_led == 0:
+            enviar_mensagem_uart(b"LED=1")
+            estado_led = 1
+        else:
+            enviar_mensagem_uart(b"LED=0")
+            estado_led = 0
+
+        time.sleep(3)
+
+
+    
+# Aguarda até que a conexão seja estabelecida e as características UART sejam encontradas,
+# ou até atingir o timeout fornecido.
+def aguardar_conexao_e_caracteristicas(timeout_segundos=30):
+    tempo_decorrido = 0
+    while tempo_decorrido < timeout_segundos:
+        if esta_conectado and caracteristicas_uart_encontradas:
+            print("Conexão estabelecida e características UART prontas para uso.")
+            return True
+
+        time.sleep(1)
+        tempo_decorrido = tempo_decorrido + 1
+
+    print("Timeout ao aguardar conexão ou descoberta de características.")
+    return False
+
+
+# Função que coordena todo o fluxo do cliente BLE UART:
+def executar_cliente_uart():
+    inicializar_bluetooth()
+    iniciar_scan()
+
+    pronto_para_usar = aguardar_conexao_e_caracteristicas(timeout_segundos=30)
+
+    if pronto_para_usar:
+        ciclo_principal_envio_comandos()
+    else:
+        print("Não foi possível preparar a comunicação UART BLE. Encerrando cliente.")
+
+
+
+executar_cliente_uart()
